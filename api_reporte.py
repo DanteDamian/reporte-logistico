@@ -4,7 +4,7 @@ from threading import Lock
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
-from ReporteSemanalV13_Orden_Fecha_Desc import (
+from ReporteSemanalV13 import (
     consultar_eventos_abiertos,
     generar_reporte,
 )
