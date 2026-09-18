@@ -13,9 +13,11 @@ Integra en un solo PDF:
 8. Gráfica de barras con distribución por departamento.
 
 Requisitos:
-    pip install requests reportlab matplotlib pillow
+    pip install requests reportlab pillow
 
-Perfil V14 Render512:
+Perfil V15 Render512 PIL:
+- elimina Matplotlib por completo para reducir el RSS base del proceso;
+- genera mapas y gráficas directamente con Pillow;
 - reduce resolución raster a la necesaria para media página;
 - generaliza únicamente CorredorWaze en el servidor;
 - libera tiles, mosaicos y geometrías inmediatamente;
@@ -39,19 +41,8 @@ import time
 import textwrap
 import gc
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-
-# Perfil de renderizado de bajo consumo para Render Free (512 MB).
-# Matplotlib documenta que simplificar paths y trocear líneas grandes reduce
-# el trabajo del backend Agg al dibujar geometrías densas.
-matplotlib.rcParams["path.simplify"] = True
-matplotlib.rcParams["path.simplify_threshold"] = 0.55
-matplotlib.rcParams["agg.path.chunksize"] = 20000
 import requests
-from PIL import Image as PILImage
+from PIL import Image as PILImage, ImageDraw, ImageFont
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -136,7 +127,7 @@ STRICT_GEOMETRY_VALIDATION = True
 # Todos los mapas del PDF usan exactamente el mismo tamaño/aspecto.
 # El mapa ocupa aproximadamente media página en el PDF. 900x560 px ya ofrece
 # una densidad visual alta en ese tamaño, mientras reduce de forma importante
-# los buffers RGBA de Matplotlib frente a 1400x850/200 dpi.
+# los buffers raster frente a 1400x850/200 dpi.
 MAP_FIGSIZE = (7.2, 4.45)
 MAP_TARGET_PIXELS = (900, 560)
 CHART_DPI = 125
@@ -543,358 +534,215 @@ def consultar_corredor_waze_por_name(nombre, max_allowable_offset=CORRIDOR_DETAI
 # GRÁFICAS
 # ============================================================
 
+def _pil_font(size=16, bold=False):
+    """Carga una fuente TrueType común sin empaquetar archivos de fuente."""
+    candidatos = []
+    if bold:
+        candidatos += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf",
+            "C:/Windows/Fonts/arialbd.ttf",
+        ]
+    else:
+        candidatos += [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+            "C:/Windows/Fonts/arial.ttf",
+        ]
+    for ruta in candidatos:
+        try:
+            return ImageFont.truetype(ruta, size=size)
+        except Exception:
+            pass
+    return ImageFont.load_default()
+
+
+def _text_size(draw, text, font):
+    box = draw.textbbox((0, 0), str(text), font=font)
+    return box[2] - box[0], box[3] - box[1]
+
+
+def _draw_text_center(draw, xy, text, font, fill=GRIS_OSCURO):
+    w, h = _text_size(draw, text, font)
+    draw.text((xy[0]-w/2, xy[1]-h/2), text, font=font, fill=fill)
+
+
+def _wrap_pixels(draw, text, font, max_width):
+    words = str(text).split()
+    if not words:
+        return [""]
+    out=[]; cur=words[0]
+    for word in words[1:]:
+        trial=cur+" "+word
+        if _text_size(draw, trial, font)[0] <= max_width:
+            cur=trial
+        else:
+            out.append(cur); cur=word
+    out.append(cur)
+    return out
+
+
+def _save_pil(img, ruta):
+    # PNG es adecuado para texto/cartografía; optimize=False consume menos CPU/RAM.
+    img.save(str(ruta), format="PNG", compress_level=5)
+    img.close()
+    gc.collect()
+
+
+def _legend_row(draw, items, y, width, font, title=None):
+    if title:
+        _draw_text_center(draw, (width/2, y), title, _pil_font(max(10, font.size if hasattr(font,'size') else 12), True), GRIS_OSCURO)
+        y += 20
+    # reparte elementos horizontalmente; si son muchos, usa dos líneas
+    max_per = 5
+    rows=[items[i:i+max_per] for i in range(0,len(items),max_per)] or [[]]
+    for row in rows:
+        widths=[]
+        for color,label,kind in row:
+            tw,_=_text_size(draw,label,font)
+            widths.append(tw+28)
+        total=sum(widths)+max(0,len(row)-1)*14
+        x=max(8,(width-total)/2)
+        for (color,label,kind),cellw in zip(row,widths):
+            if kind=='line':
+                draw.line((x,y+7,x+18,y+7),fill=color,width=4)
+            else:
+                draw.ellipse((x+3,y+1,x+15,y+13),outline=color,width=3,fill='white')
+            draw.text((x+22,y),label,font=font,fill=GRIS_OSCURO)
+            x += cellw+14
+        y += 20
+    return y
+
+
 def estilo_base(ax):
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_color(GRIS_LINEA)
-    ax.spines["bottom"].set_color(GRIS_LINEA)
-    ax.tick_params(colors=GRIS, labelsize=8)
-    ax.grid(axis="x", alpha=0.15)
-    ax.set_axisbelow(True)
+    # Compatibilidad con versiones anteriores; V15 dibuja todo con Pillow.
+    return None
 
 
 def grafica_corredores(eventos, ruta):
-    """
-    Gráfica horizontal apilada:
-    cada barra representa un corredor y se subdivide por impacto logístico.
-    """
-    orden_impacto = ["Critico", "Importante", "Moderado", "Medio", "Minimo"]
+    orden=["Critico","Importante","Moderado","Medio","Minimo"]
+    colores={"Critico":ROJO,"Importante":NARANJA,"Moderado":AZUL,"Medio":AMARILLO,"Minimo":"#A7A9AC"}
+    matriz=defaultdict(Counter)
+    for e in eventos:
+        matriz[etiqueta_corredor(e.get("corredor_logistico"))][etiqueta_categoria(e.get("tipo_impacto"))]+=1
+    corredores=sorted(matriz,key=lambda c:sum(matriz[c].values()),reverse=True)
+    W,H=920,470
+    img=PILImage.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
+    ft=_pil_font(19,True); fl=_pil_font(12); fv=_pil_font(12,True); fleg=_pil_font(11)
+    _draw_text_center(d,(W/2,24),'Eventos abiertos por corredor e impacto logístico',ft)
+    left,right,top,bottom=245,55,58,115
+    n=max(1,len(corredores)); rowh=max(31,(H-top-bottom)//n)
+    max_total=max([sum(matriz[c].values()) for c in corredores] or [1])
+    plotw=W-left-right
+    # grilla
+    for t in range(max_total+1):
+        x=left+plotw*t/max_total
+        d.line((x,top,x,H-bottom+4),fill='#ECEFF3',width=1)
+    for i,c in enumerate(corredores):
+        y=top+i*rowh+rowh//2
+        lines=_wrap_pixels(d,c,fl,left-20)[:2]
+        yy=y-(len(lines)*14)//2
+        for line in lines:
+            tw,_=_text_size(d,line,fl); d.text((left-12-tw,yy),line,font=fl,fill=GRIS_OSCURO); yy+=14
+        x=left
+        for imp in orden:
+            v=matriz[c].get(imp,0)
+            if not v: continue
+            w=plotw*v/max_total
+            d.rectangle((x,y-10,x+w,y+10),fill=colores[imp])
+            x+=w
+        total=sum(matriz[c].values())
+        d.text((min(W-25,x+7),y-8),str(total),font=fv,fill=GRIS_OSCURO)
+    items=[(colores[i],i,'box') for i in orden if any(matriz[c].get(i,0) for c in corredores)]
+    _legend_row(d,items,H-78,W,fleg,'Impacto logístico')
+    _save_pil(img,ruta)
 
-    colores_impacto = {
-        "Critico": ROJO,
-        "Importante": NARANJA,
-        "Moderado": AZUL,
-        "Medio": AMARILLO,
-        "Minimo": "#A7A9AC",
-    }
 
-    # Conteo por corredor e impacto
-    matriz = defaultdict(Counter)
-
-    for evento in eventos:
-        corredor = etiqueta_corredor(evento.get("corredor_logistico"))
-        impacto = etiqueta_categoria(evento.get("tipo_impacto"))
-        matriz[corredor][impacto] += 1
-
-    # Ordenar corredores por total de eventos, de mayor a menor
-    corredores = sorted(
-        matriz.keys(),
-        key=lambda c: sum(matriz[c].values()),
-        reverse=True,
-    )
-
-    # Para barh, invertimos para dejar el mayor arriba
-    corredores_plot = corredores[::-1]
-
-    fig, ax = plt.subplots(figsize=(7.4, 3.8))
-
-    acumulado = [0] * len(corredores_plot)
-
-    for impacto in orden_impacto:
-        valores = [matriz[c].get(impacto, 0) for c in corredores_plot]
-
-        ax.barh(
-            corredores_plot,
-            valores,
-            left=acumulado,
-            label=impacto,
-            color=colores_impacto[impacto],
-        )
-
-        acumulado = [
-            base + valor
-            for base, valor in zip(acumulado, valores)
-        ]
-
-    # Mostrar el total al final de cada barra
-    for i, corredor in enumerate(corredores_plot):
-        total = sum(matriz[corredor].values())
-        ax.text(
-            total + 0.25,
-            i,
-            str(total),
-            va="center",
-            fontsize=8,
-            fontweight="bold",
-            color=GRIS,
-        )
-
-    ax.set_title(
-        "Eventos abiertos por corredor e impacto logístico",
-        fontsize=11,
-        fontweight="bold",
-        pad=8,
-    )
-    ax.set_xlabel("Cantidad de eventos", fontsize=8)
-
-    estilo_base(ax)
-
-    max_total = max(sum(matriz[c].values()) for c in corredores_plot)
-    ax.set_xlim(0, max_total * 1.15)
-
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            title="Impacto logístico",
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.015),
-            ncol=min(5, len(handles)),
-            fontsize=7,
-            title_fontsize=7.5,
-            frameon=False,
-            columnspacing=1.1,
-        )
-
-    # Reserva un área exclusiva para la leyenda; evita que se superponga con
-    # el rótulo "Cantidad de eventos".
-    fig.tight_layout(rect=[0, 0.19, 1, 1])
-    fig.savefig(
-        ruta,
-        dpi=CHART_DPI,
-        facecolor="white",
-    )
-    plt.close(fig)
-    gc.collect()
+def _grafica_donut(contador, ruta, titulo, centro_color, paleta):
+    labels=list(contador.keys()); vals=list(contador.values()); total=sum(vals) or 1
+    W,H=500,400
+    img=PILImage.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
+    ft=_pil_font(18,True); fl=_pil_font(12); fc=_pil_font(27,True); fs=_pil_font(12)
+    _draw_text_center(d,(W/2,25),titulo,ft)
+    box=(145,65,355,275); start=-90.0
+    for i,(lab,v) in enumerate(zip(labels,vals)):
+        end=start+360.0*v/total
+        d.pieslice(box,start=start,end=end,fill=paleta[i%len(paleta)],outline='white',width=2)
+        start=end
+    d.ellipse((195,115,305,225),fill='white')
+    _draw_text_center(d,(250,160),str(sum(vals)),fc,centro_color)
+    _draw_text_center(d,(250,190),'eventos',fs,GRIS)
+    y=300
+    for i,(lab,v) in enumerate(zip(labels,vals)):
+        color=paleta[i%len(paleta)]
+        d.rectangle((62,y+2,76,y+14),fill=color)
+        d.text((84,y),f'{lab}: {v}',font=fl,fill=GRIS_OSCURO)
+        y+=21
+        if y>380: break
+    _save_pil(img,ruta)
 
 
 def grafica_tipo_evento(eventos, ruta):
-    contador = Counter(etiqueta_categoria(e.get("tipo_evento")) for e in eventos)
-    labels = list(contador.keys())
-    valores = list(contador.values())
-    paleta = [NARANJA, AZUL, AMARILLO, ROJO][:len(labels)]
-
-    fig, ax = plt.subplots(figsize=(4.0, 3.2))
-    wedges, _ = ax.pie(
-        valores,
-        startangle=90,
-        colors=paleta,
-        wedgeprops={"width": 0.42, "edgecolor": "white"},
-    )
-
-    ax.text(0, 0.08, str(sum(valores)), ha="center", va="center",
-            fontsize=18, fontweight="bold", color=NARANJA)
-    ax.text(0, -0.16, "eventos", ha="center", va="center",
-            fontsize=8, color=GRIS)
-
-    ax.set_title("Tipo de evento", fontsize=11, fontweight="bold")
-    fig.legend(
-        wedges,
-        [f"{lab}: {val}" for lab, val in zip(labels, valores)],
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.02),
-        fontsize=7.2,
-        frameon=False,
-        ncol=1,
-    )
-
-    fig.tight_layout(rect=[0, 0.18, 1, 1])
-    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
-    plt.close(fig)
-    gc.collect()
+    contador=Counter(etiqueta_categoria(e.get('tipo_evento')) for e in eventos)
+    _grafica_donut(contador,ruta,'Tipo de evento',NARANJA,[NARANJA,AZUL,AMARILLO,ROJO,'#A7A9AC'])
 
 
 def grafica_tipo_cierre(eventos, ruta):
-    contador = Counter(etiqueta_categoria(e.get("tipo_cierre")) for e in eventos)
-    labels = list(contador.keys())
-    valores = list(contador.values())
-    paleta = [AZUL, NARANJA, ROJO][:len(labels)]
-
-    fig, ax = plt.subplots(figsize=(4.0, 3.2))
-    wedges, _ = ax.pie(
-        valores,
-        startangle=90,
-        colors=paleta,
-        wedgeprops={"width": 0.42, "edgecolor": "white"},
-    )
-
-    ax.text(0, 0.08, str(sum(valores)), ha="center", va="center",
-            fontsize=18, fontweight="bold", color=AZUL)
-    ax.text(0, -0.16, "eventos", ha="center", va="center",
-            fontsize=8, color=GRIS)
-
-    ax.set_title("Tipo de cierre", fontsize=11, fontweight="bold")
-    fig.legend(
-        wedges,
-        [f"{lab}: {val}" for lab, val in zip(labels, valores)],
-        loc="lower center",
-        bbox_to_anchor=(0.5, 0.02),
-        fontsize=7.2,
-        frameon=False,
-        ncol=1,
-    )
-
-    fig.tight_layout(rect=[0, 0.18, 1, 1])
-    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
-    plt.close(fig)
-    gc.collect()
+    contador=Counter(etiqueta_categoria(e.get('tipo_cierre')) for e in eventos)
+    _grafica_donut(contador,ruta,'Tipo de cierre',AZUL,[AZUL,NARANJA,ROJO,'#A7A9AC'])
 
 
 def grafica_impacto(eventos, ruta):
-    contador = Counter(etiqueta_categoria(e.get("tipo_impacto")) for e in eventos)
-
-    orden = ["Critico", "Importante", "Moderado", "Medio", "Minimo"]
-    datos = [(cat, contador.get(cat, 0)) for cat in orden if cat in contador]
-    conocidos = {x[0] for x in datos}
-
-    for cat, valor in contador.items():
-        if cat not in conocidos:
-            datos.append((cat, valor))
-
-    nombres = [x[0] for x in datos][::-1]
-    valores = [x[1] for x in datos][::-1]
-
-    colores_impacto = {
-        "Critico": ROJO,
-        "Importante": NARANJA,
-        "Moderado": AZUL,
-        "Medio": AMARILLO,
-        "Minimo": "#A7A9AC",
-    }
-
-    fig, ax = plt.subplots(figsize=(7.2, 3.25))
-    barras = ax.barh(
-        nombres,
-        valores,
-        color=[colores_impacto.get(n, NARANJA) for n in nombres],
-    )
-
-    ax.set_title("Impacto logístico", fontsize=11, fontweight="bold")
-    ax.set_xlabel("Cantidad de eventos", fontsize=8)
-    estilo_base(ax)
-
-    for barra, valor in zip(barras, valores):
-        ax.text(
-            barra.get_width() + 0.18,
-            barra.get_y() + barra.get_height() / 2,
-            str(valor),
-            va="center",
-            fontsize=8,
-            fontweight="bold",
-            color=GRIS,
-        )
-
-    ax.set_xlim(0, max(valores) * 1.18)
-    fig.tight_layout()
-    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
-    plt.close(fig)
-    gc.collect()
+    contador=Counter(etiqueta_categoria(e.get('tipo_impacto')) for e in eventos)
+    orden=["Critico","Importante","Moderado","Medio","Minimo"]
+    datos=[(x,contador[x]) for x in orden if contador.get(x)] + [(k,v) for k,v in contador.items() if k not in orden]
+    colores={"Critico":ROJO,"Importante":NARANJA,"Moderado":AZUL,"Medio":AMARILLO,"Minimo":"#A7A9AC"}
+    W,H=900,390; img=PILImage.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
+    ft=_pil_font(19,True); fl=_pil_font(13); fv=_pil_font(12,True); fx=_pil_font(10)
+    _draw_text_center(d,(W/2,24),'Impacto logístico',ft)
+    left,right,top,bottom=160,55,62,52; plotw=W-left-right
+    maxv=max([v for _,v in datos] or [1]); rowh=max(38,(H-top-bottom)//max(1,len(datos)))
+    for t in range(maxv+1):
+        x=left+plotw*t/maxv; d.line((x,top,x,H-bottom),fill='#EDF0F4',width=1)
+        tw,_=_text_size(d,str(t),fx); d.text((x-tw/2,H-bottom+5),str(t),font=fx,fill=GRIS)
+    for i,(lab,v) in enumerate(datos):
+        y=top+i*rowh+rowh//2
+        tw,_=_text_size(d,lab,fl); d.text((left-12-tw,y-8),lab,font=fl,fill=GRIS_OSCURO)
+        w=plotw*v/maxv; d.rectangle((left,y-12,left+w,y+12),fill=colores.get(lab,NARANJA))
+        d.text((left+w+8,y-8),str(v),font=fv,fill=GRIS_OSCURO)
+    _save_pil(img,ruta)
 
 
 def grafica_departamentos_corredor(eventos_corredor, ruta, nombre_corredor):
-    """
-    Gráfica horizontal apilada por departamento e impacto logístico.
-
-    Está diseñada para mostrarse junto al mapa dentro de una tarjeta del PDF:
-    por eso evita repetir el nombre del corredor y prioriza barras, etiquetas
-    y leyenda.
-    """
-    orden_impacto = ["Critico", "Importante", "Moderado", "Medio", "Minimo"]
-
-    colores_impacto = {
-        "Critico": ROJO,
-        "Importante": NARANJA,
-        "Moderado": AZUL,
-        "Medio": AMARILLO,
-        "Minimo": "#A7A9AC",
-    }
-
-    matriz = defaultdict(Counter)
-    for evento in eventos_corredor:
-        departamento = normalizar_departamento(evento.get("departamento"))
-        impacto = etiqueta_categoria(evento.get("tipo_impacto"))
-        matriz[departamento][impacto] += 1
-
-    impactos_presentes = {
-        impacto
-        for conteos in matriz.values()
-        for impacto in conteos.keys()
-    }
-    impactos_extra = sorted(
-        impactos_presentes.difference(orden_impacto),
-        key=str.casefold,
-    )
-    orden_final = orden_impacto + impactos_extra
-
-    # Mayor número de eventos arriba.
-    departamentos = sorted(
-        matriz.keys(),
-        key=lambda d: (sum(matriz[d].values()), d.casefold()),
-    )
-
-    altura = max(3.6, 0.46 * len(departamentos) + 2.15)
-    fig, ax = plt.subplots(figsize=(7.6, altura))
-    fig.patch.set_facecolor("white")
-    ax.set_facecolor("#FBFCFE")
-
-    acumulado = [0] * len(departamentos)
-    for impacto in orden_final:
-        valores = [matriz[d].get(impacto, 0) for d in departamentos]
-        if not any(valores):
-            continue
-        ax.barh(
-            departamentos,
-            valores,
-            left=acumulado,
-            height=0.62,
-            label=impacto,
-            color=colores_impacto.get(impacto, "#7F7F7F"),
-            edgecolor="white",
-            linewidth=0.7,
-        )
-        acumulado = [base + valor for base, valor in zip(acumulado, valores)]
-
-    max_total = max((sum(matriz[d].values()) for d in departamentos), default=1)
-    for i, departamento in enumerate(departamentos):
-        total = sum(matriz[departamento].values())
-        ax.text(
-            total + max(0.07, max_total * 0.025),
-            i,
-            str(total),
-            va="center",
-            fontsize=8.4,
-            fontweight="bold",
-            color=GRIS_OSCURO,
-        )
-
-    # El título principal lo aporta la tarjeta del PDF.
-    ax.set_xlabel("Cantidad de eventos abiertos", fontsize=8.2, labelpad=6)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    ax.spines["left"].set_visible(False)
-    ax.spines["bottom"].set_color(GRIS_LINEA)
-    ax.tick_params(axis="y", colors=GRIS_OSCURO, labelsize=8.2, length=0)
-    ax.tick_params(axis="x", colors=GRIS, labelsize=7.6)
-    ax.xaxis.grid(True, alpha=0.18, linewidth=0.7)
-    ax.set_axisbelow(True)
-    ax.set_xlim(0, max_total * 1.18 if max_total else 1)
-
-    handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles,
-            labels,
-            title="Impacto logístico",
-            loc="lower center",
-            bbox_to_anchor=(0.5, 0.012),
-            ncol=min(5, len(handles)),
-            fontsize=7.1,
-            title_fontsize=7.5,
-            frameon=False,
-            handlelength=1.6,
-            handletextpad=0.45,
-            columnspacing=1.0,
-        )
-
-    fig.tight_layout(rect=[0.015, 0.18, 0.985, 0.98])
-    fig.savefig(
-        ruta,
-        dpi=CHART_DPI,
-        facecolor="white",
-    )
-    plt.close(fig)
-    gc.collect()
+    orden=["Critico","Importante","Moderado","Medio","Minimo"]
+    colores={"Critico":ROJO,"Importante":NARANJA,"Moderado":AZUL,"Medio":AMARILLO,"Minimo":"#A7A9AC"}
+    matriz=defaultdict(Counter)
+    for e in eventos_corredor:
+        matriz[normalizar_departamento(e.get('departamento'))][etiqueta_categoria(e.get('tipo_impacto'))]+=1
+    deps=sorted(matriz,key=lambda d:(sum(matriz[d].values()),d.casefold()),reverse=True)
+    W=900; H=max(370,155+max(1,len(deps))*52)
+    img=PILImage.new('RGB',(W,H),'white'); d=ImageDraw.Draw(img)
+    fl=_pil_font(12); fv=_pil_font(11,True); fleg=_pil_font(10)
+    left,right,top,bottom=185,55,28,100; plotw=W-left-right
+    maxv=max([sum(matriz[x].values()) for x in deps] or [1]); rowh=(H-top-bottom)//max(1,len(deps))
+    # background plot
+    d.rectangle((left-4,top,W-right+4,H-bottom),fill='#FBFCFE')
+    for t in range(maxv+1):
+        x=left+plotw*t/maxv; d.line((x,top,x,H-bottom),fill='#E9EDF2',width=1)
+    for i,dep in enumerate(deps):
+        y=top+i*rowh+rowh//2
+        lines=_wrap_pixels(d,dep,fl,left-18)[:2]; yy=y-(len(lines)*14)//2
+        for line in lines:
+            tw,_=_text_size(d,line,fl); d.text((left-10-tw,yy),line,font=fl,fill=GRIS_OSCURO); yy+=14
+        x=left
+        for imp in orden + sorted(set(matriz[dep]).difference(orden)):
+            v=matriz[dep].get(imp,0)
+            if not v: continue
+            w=plotw*v/maxv; d.rectangle((x,y-13,x+w,y+13),fill=colores.get(imp,'#7F7F7F'),outline='white',width=1); x+=w
+        d.text((x+7,y-8),str(sum(matriz[dep].values())),font=fv,fill=GRIS_OSCURO)
+    items=[(colores.get(i,'#7F7F7F'),i,'box') for i in orden if any(matriz[d].get(i,0) for d in deps)]
+    _legend_row(d,items,H-72,W,fleg,'Impacto logístico')
+    _save_pil(img,ruta)
 
 
 # ============================================================
@@ -1200,16 +1048,42 @@ def _vertices_corredor(features):
     return vertices
 
 
-def _dibujar_corredor(ax, features, color="#F36C21", alpha=0.95, lw=2.25, zorder=3):
-    """Dibuja todos los segmentos devueltos por el filtro CorredorWaze.Name."""
+def _xy_a_pixel(x, y, extent, box):
+    xmin, ymin, xmax, ymax = extent
+    x0, y0, x1, y1 = box
+    px = x0 + (x - xmin) / (xmax - xmin) * (x1 - x0)
+    py = y0 + (ymax - y) / (ymax - ymin) * (y1 - y0)
+    return px, py
+
+
+def _dibujar_corredor_pil(draw, features, extent, box, color="#F36C21", width=4):
     for feature in _normalizar_features_corredor(features):
-        for path in feature.get("paths", []):
+        for path in feature.get('paths', []):
             if len(path) < 2:
                 continue
-            xs = [p[0] for p in path]
-            ys = [p[1] for p in path]
-            ax.plot(xs, ys, color="white", lw=lw + 2.4, alpha=0.9, zorder=zorder)
-            ax.plot(xs, ys, color=color, lw=lw, alpha=alpha, zorder=zorder + 0.1)
+            pts=[_xy_a_pixel(float(p[0]),float(p[1]),extent,box) for p in path]
+            draw.line(pts,fill='white',width=width+4,joint='curve')
+            draw.line(pts,fill=color,width=width,joint='curve')
+
+
+def _recortar_osm_a_extent(basemap, basemap_extent, extent, out_size):
+    bxmin, bymin, bxmax, bymax = basemap_extent
+    xmin, ymin, xmax, ymax = extent
+    bw, bh = basemap.size
+    left=(xmin-bxmin)/(bxmax-bxmin)*bw
+    right=(xmax-bxmin)/(bxmax-bxmin)*bw
+    top=(bymax-ymax)/(bymax-bymin)*bh
+    bottom=(bymax-ymin)/(bymax-bymin)*bh
+    left=max(0,int(math.floor(left))); top=max(0,int(math.floor(top)))
+    right=min(bw,int(math.ceil(right))); bottom=min(bh,int(math.ceil(bottom)))
+    if right<=left or bottom<=top:
+        raise RuntimeError('No fue posible recortar el mosaico OSM a la extensión solicitada.')
+    crop=basemap.crop((left,top,right,bottom))
+    try:
+        out=crop.resize(out_size, PILImage.Resampling.LANCZOS)
+    finally:
+        crop.close()
+    return out
 
 
 def _envolver_titulo(texto, ancho=58):
@@ -1247,171 +1121,66 @@ def mapa_eventos_corredor(
     corredor_name=None,
     cobertura_parcial=False,
 ):
-    """
-    Mapa del corredor actual.
-
-    El flujo es intencionalmente simple:
-      1) usa el Shape puntual del evento ya consultado en EPSG:3857;
-      2) recibe TODOS los segmentos de CorredorWaze filtrados por Name;
-      3) dibuja ambos sobre OpenStreetMap en Web Mercator.
-
-    No calcula distancias al corredor, no hace snapping y no selecciona un
-    segmento por cercanía.
-    """
-    corredor_features = corredor_features or []
-    registros = []
-    invalidos = []
-
+    """Mapa del corredor generado solo con Pillow para minimizar memoria."""
+    corredor_features=corredor_features or []
+    registros=[]; invalidos=[]
     for evento in eventos_corredor:
-        punto = _shape_point_3857(evento.get("_geometry"))
+        punto=_shape_point_3857(evento.get('_geometry'))
         if punto is None:
-            invalidos.append(evento.get("objectid"))
-            continue
-        registros.append((punto[0], punto[1], evento))
-
+            invalidos.append(evento.get('objectid')); continue
+        registros.append((punto[0],punto[1],evento))
     if invalidos and STRICT_GEOMETRY_VALIDATION:
-        raise RuntimeError(
-            f"El corredor {nombre_corredor!r} tiene eventos sin Shape puntual válido: "
-            f"{invalidos}."
-        )
+        raise RuntimeError(f"El corredor {nombre_corredor!r} tiene eventos sin Shape puntual válido: {invalidos}.")
     if not registros:
         return False
-
-    puntos_contexto = [(x, y) for x, y, _ in registros]
-    puntos_contexto.extend(_vertices_corredor(corredor_features))
-
-    extent = _ajustar_extension_mapa_3857(
-        puntos_contexto,
-        aspecto_panel=MAP_PANEL_ASPECT,
-        margen=1.10,
-        span_minimo_m=35000.0,
-    )
-    basemap, basemap_extent, zoom = descargar_mosaico_osm(extent)
-    _validar_registro_osm_shape(registros, basemap_extent, basemap)
-    imshow_extent = _extent_imshow_desde_xyxy(basemap_extent)
-
-    colores_impacto = {
-        "Critico": ROJO,
-        "Importante": NARANJA,
-        "Moderado": AZUL,
-        "Medio": AMARILLO,
-        "Minimo": "#A7A9AC",
-    }
-
-    fig = plt.figure(figsize=MAP_FIGSIZE)
-    ax = fig.add_axes([0.025, 0.145, 0.95, 0.825])
-    ax.imshow(
-        basemap,
-        extent=imshow_extent,
-        origin="upper",
-        interpolation="nearest",
-        resample=False,
-        zorder=0,
-    )
-
-    _dibujar_corredor(ax, corredor_features, color="#F36C21", lw=2.25, zorder=2.5)
-
-    impactos = defaultdict(list)
-    for x, y, evento in registros:
-        impacto = etiqueta_categoria(evento.get("tipo_impacto"))
-        impactos[impacto].append((x, y, evento))
-
-    orden = ["Critico", "Importante", "Moderado", "Medio", "Minimo"]
-    extras = sorted(set(impactos).difference(orden), key=str.casefold)
-    orden_visible = [i for i in orden + extras if impactos.get(i)]
-
-    for impacto in orden_visible:
-        grupo = impactos[impacto]
-        xs = [r[0] for r in grupo]
-        ys = [r[1] for r in grupo]
-        color_impacto = colores_impacto.get(impacto, "#7F7F7F")
-        ax.scatter(xs, ys, s=84, facecolors="none", edgecolors="white", linewidths=3.8, zorder=5)
-        ax.scatter(xs, ys, s=66, facecolors="none", edgecolors=color_impacto, linewidths=2.2, zorder=6)
-        ax.scatter(xs, ys, s=12, c=color_impacto, edgecolors="none", zorder=7)
-
-    offsets = [(5, 6), (5, -13), (-5, 6), (-5, -13), (8, 0), (-8, 0)]
-    for indice, (x, y, evento) in enumerate(
-        sorted(registros, key=lambda r: int(r[2].get("objectid") or 0))
-    ):
-        oid = str(evento.get("objectid") or "")
-        if not oid:
-            continue
-        dx, dy = offsets[indice % len(offsets)]
-        ax.annotate(
-            oid, (x, y), xytext=(dx, dy), textcoords="offset points",
-            ha="left" if dx >= 0 else "right",
-            va="bottom" if dy >= 0 else "top",
-            fontsize=6.7, fontweight="bold", color=GRIS_OSCURO,
-            bbox={"boxstyle": "round,pad=0.16", "fc": "white", "ec": "#B8B8B8", "lw": 0.45, "alpha": 0.90},
-            zorder=8,
-        )
-
-    xmin, ymin, xmax, ymax = extent
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
-    ax.set_aspect("equal", adjustable="box")
-    ax.axis("off")
-
-    ax.annotate(
-        "N", xy=(0.965, 0.94), xytext=(0.965, 0.82),
-        xycoords="axes fraction", textcoords="axes fraction",
-        ha="center", va="center", fontsize=9, fontweight="bold",
-        arrowprops={"arrowstyle": "-|>", "lw": 1.25, "color": GRIS_OSCURO},
-        bbox={"boxstyle": "round,pad=0.10", "fc": "white", "ec": "none", "alpha": 0.72},
-        zorder=8,
-    )
-
-    handles = []
-    if corredor_features:
-        handles.append(Line2D([0], [0], color="#F36C21", lw=2.6, label="Corredor logístico"))
-    handles.extend([
-        Line2D(
-            [0], [0], marker="o", linestyle="None", markersize=7.4,
-            markerfacecolor="white", markeredgecolor=colores_impacto.get(impacto, "#7F7F7F"),
-            markeredgewidth=1.8, label=f"{impacto} ({len(impactos[impacto])})",
-        )
-        for impacto in orden_visible
-    ])
-    if handles:
-        fig.legend(
-            handles=handles,
-            title="Impacto logístico",
-            loc="lower center", bbox_to_anchor=(0.5, 0.008),
-            ncol=min(6, len(handles)), fontsize=7.0, title_fontsize=7.6,
-            frameon=False, handletextpad=0.5, columnspacing=1.0,
-        )
-
+    contexto=[(x,y) for x,y,_ in registros]; contexto.extend(_vertices_corredor(corredor_features))
+    extent=_ajustar_extension_mapa_3857(contexto,aspecto_panel=MAP_PANEL_ASPECT,margen=1.10,span_minimo_m=35000.0)
+    basemap,basemap_extent,zoom=descargar_mosaico_osm(extent)
+    _validar_registro_osm_shape(registros,basemap_extent,basemap)
+    W,H=MAP_TARGET_PIXELS; legend_h=72; map_h=H-legend_h
+    canvas=PILImage.new('RGB',(W,H),'white')
+    mapimg=_recortar_osm_a_extent(basemap,basemap_extent,extent,(W,map_h))
+    canvas.paste(mapimg,(0,0)); mapimg.close(); basemap.close(); del basemap
+    d=ImageDraw.Draw(canvas); box=(0,0,W-1,map_h-1)
+    _dibujar_corredor_pil(d,corredor_features,extent,box,width=4)
+    colores={"Critico":ROJO,"Importante":NARANJA,"Moderado":AZUL,"Medio":AMARILLO,"Minimo":"#A7A9AC"}
+    impactos=defaultdict(list)
+    for x,y,e in registros: impactos[etiqueta_categoria(e.get('tipo_impacto'))].append((x,y,e))
+    orden=["Critico","Importante","Moderado","Medio","Minimo"]
+    visible=[i for i in orden+sorted(set(impactos).difference(orden)) if impactos.get(i)]
+    for imp in visible:
+        col=colores.get(imp,'#7F7F7F')
+        for x,y,e in impactos[imp]:
+            px,py=_xy_a_pixel(x,y,extent,box)
+            r=8
+            d.ellipse((px-r-2,py-r-2,px+r+2,py+r+2),fill='white')
+            d.ellipse((px-r,py-r,px+r,py+r),outline=col,width=4,fill='white')
+            d.ellipse((px-2,py-2,px+2,py+2),fill=col)
+    f_oid=_pil_font(11,True); offsets=[(7,-17),(7,8),(-32,-17),(-32,8),(10,-5),(-38,-5)]
+    for idx,(x,y,e) in enumerate(sorted(registros,key=lambda r:int(r[2].get('objectid') or 0))):
+        oid=str(e.get('objectid') or '')
+        if not oid: continue
+        px,py=_xy_a_pixel(x,y,extent,box); dx,dy=offsets[idx%len(offsets)]
+        tw,th=_text_size(d,oid,f_oid); tx,ty=px+dx,py+dy
+        d.rounded_rectangle((tx-2,ty-1,tx+tw+2,ty+th+2),radius=2,fill='white',outline='#B8B8B8',width=1)
+        d.text((tx,ty),oid,font=f_oid,fill=GRIS_OSCURO)
+    # norte
+    f_n=_pil_font(16,True); nx=W-28; d.text((nx-5,18),'N',font=f_n,fill=GRIS_OSCURO); d.line((nx,45,nx,78),fill=GRIS_OSCURO,width=3); d.polygon([(nx,39),(nx-7,53),(nx+7,53)],fill=GRIS_OSCURO)
+    fsmall=_pil_font(9)
     if cobertura_parcial and corredor_name:
-        ax.text(
-            0.012, 0.018, f"Corredor disponible: {corredor_name}",
-            transform=ax.transAxes, fontsize=6.1, color=GRIS_OSCURO,
-            ha="left", va="bottom",
-            bbox={"boxstyle": "round,pad=0.18", "fc": "white", "ec": "#D8DDE5", "lw": 0.45, "alpha": 0.88},
-            zorder=8,
-        )
-
-    ax.text(
-        0.988, 0.018, "© OpenStreetMap contributors",
-        transform=ax.transAxes, fontsize=6.0, color=GRIS_OSCURO,
-        ha="right", va="bottom",
-        bbox={"boxstyle": "round,pad=0.16", "fc": "white", "ec": "none", "alpha": 0.82},
-        zorder=8,
-    )
-
-    fig.savefig(ruta, dpi=MAP_DPI, facecolor="white")
-    plt.close(fig)
-    try:
-        basemap.close()
-    except Exception:
-        pass
-    del basemap
+        txt=f'Corredor disponible: {corredor_name}'
+        d.rounded_rectangle((8,map_h-26,8+_text_size(d,txt,fsmall)[0]+10,map_h-7),radius=3,fill='white',outline='#D8DDE5')
+        d.text((13,map_h-23),txt,font=fsmall,fill=GRIS_OSCURO)
+    osm='© OpenStreetMap contributors'; tw,_=_text_size(d,osm,fsmall)
+    d.rectangle((W-tw-10,map_h-21,W-3,map_h-3),fill='white'); d.text((W-tw-7,map_h-19),osm,font=fsmall,fill=GRIS_OSCURO)
+    items=[]
+    if corredor_features: items.append(('#F36C21','Corredor logístico','line'))
+    for imp in visible: items.append((colores.get(imp,'#7F7F7F'),f'{imp} ({len(impactos[imp])})','box'))
+    _legend_row(d,items,map_h+8,W,_pil_font(10),'Impacto logístico')
+    _save_pil(canvas,ruta)
+    del corredor_features, registros, impactos
     gc.collect()
-
-    print(
-        f"Mapa {nombre_corredor}: {len(registros)} evento(s), "
-        f"{len(corredor_features)} segmento(s) de CorredorWaze "
-        f"filtrados por Name={corredor_name!r}."
-    )
+    print(f"Mapa {nombre_corredor}: {len(eventos_corredor)} evento(s), corredor filtrado por Name={corredor_name!r}.")
     return True
 
 
@@ -1463,137 +1232,43 @@ def _agrupar_eventos_proximidad(registros, radio_m=SUMMARY_CLUSTER_RADIUS_M):
 
 
 def mapa_resumen_general(eventos, corredores_activos, ruta):
-    """
-    Mapa compacto para el resumen ejecutivo.
-
-    Ocupa casi todo el lienzo del recuadro, muestra únicamente los corredores
-    asociados a eventos abiertos y agrupa visualmente incidentes próximos para
-    evitar saturación a escala nacional.
-    """
-    registros = []
+    """Mapa compacto del resumen generado únicamente con Pillow."""
+    registros=[]
     for evento in eventos:
-        punto = _shape_point_3857(evento.get("_geometry"))
-        if punto is not None:
-            registros.append((punto[0], punto[1], evento))
-    if not registros:
-        return False
-
-    contexto = [(x, y) for x, y, _ in registros]
-    # corredores_activos ya es una lista plana de todos los segmentos
-    # consultados por Name. Se procesa de una sola vez.
-    contexto.extend(_vertices_corredor(corredores_activos))
-
-    aspecto = SUMMARY_MAP_TARGET_PIXELS[0] / SUMMARY_MAP_TARGET_PIXELS[1]
-    extent = _ajustar_extension_mapa_3857(
-        contexto,
-        aspecto_panel=aspecto,
-        margen=1.06,
-        span_minimo_m=250_000.0,
-    )
-    basemap, basemap_extent, zoom = descargar_mosaico_osm(extent)
-    _validar_registro_osm_shape(registros, basemap_extent, basemap)
-    imshow_extent = _extent_imshow_desde_xyxy(basemap_extent)
-
-    clusters = _agrupar_eventos_proximidad(registros, SUMMARY_CLUSTER_RADIUS_M)
-    fig = plt.figure(figsize=SUMMARY_MAP_FIGSIZE)
-    # Se minimizan márgenes internos: el mapa debe ser claramente legible aun
-    # cuando se inserte como panel secundario del resumen ejecutivo.
-    ax = fig.add_axes([0.015, 0.045, 0.97, 0.885])
-    ax.imshow(
-        basemap, extent=imshow_extent, origin="upper",
-        interpolation="nearest", resample=False, zorder=0,
-    )
-
-    # Dibuja todos los segmentos de todos los corredores activos.
-    _dibujar_corredor(
-        ax, corredores_activos, color="#F36C21", alpha=0.82, lw=1.55, zorder=2
-    )
-
-    for cluster in clusters:
-        n = cluster["n"]
-        size = 30 if n == 1 else min(165, 48 + 20 * math.sqrt(n))
-        ax.scatter(
-            [cluster["x"]], [cluster["y"]], s=size,
-            c=ROJO, edgecolors="white", linewidths=1.55, alpha=0.94, zorder=5,
-        )
-        if n > 1:
-            ax.text(
-                cluster["x"], cluster["y"], str(n),
-                ha="center", va="center", fontsize=6.7, fontweight="bold",
-                color="white", zorder=6,
-            )
-
-    xmin, ymin, xmax, ymax = extent
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
-    ax.set_aspect("equal", adjustable="box")
-    ax.axis("off")
-
-    fig.text(
-        0.5, 0.975, "Distribución espacial de eventos abiertos",
-        ha="center", va="top", fontsize=9.2, fontweight="bold",
-    )
-
-    departamentos = Counter(normalizar_departamento(e.get("departamento")) for e in eventos)
-    top_dep = departamentos.most_common(3)
-    n_grupos = sum(1 for c in clusters if c["n"] > 1)
-    max_grupo = max((c["n"] for c in clusters), default=1)
-
-    linea1 = (
-        f"{len(registros)} eventos  ·  {n_grupos} agrupaciones  ·  "
-        f"máx. {max_grupo} eventos/grupo"
-    )
-    lineas_estad = [linea1]
-    if top_dep:
-        lineas_estad.append(
-            "Mayor presencia: " + ", ".join(f"{d} ({n})" for d, n in top_dep)
-        )
-
-    ax.text(
-        0.014, 0.986, "\n".join(lineas_estad), transform=ax.transAxes,
-        ha="left", va="top", fontsize=5.75, color=GRIS_OSCURO,
-        bbox={"boxstyle": "round,pad=0.22", "fc": "white", "ec": "#D0D0D0", "lw": 0.4, "alpha": 0.90},
-        zorder=8,
-    )
-
-    handles = [
-        Line2D([0], [0], color="#F36C21", lw=1.9, label="Corredor con eventos"),
-        Line2D(
-            [0], [0], marker="o", linestyle="None", markersize=5.8,
-            markerfacecolor=ROJO, markeredgecolor="white",
-            label=f"Evento / agrupación ≤ {SUMMARY_CLUSTER_RADIUS_M/1000:.0f} km",
-        ),
-    ]
-    leg = ax.legend(
-        handles=handles,
-        loc="lower left",
-        bbox_to_anchor=(0.008, 0.014),
-        ncol=1,
-        fontsize=5.35,
-        frameon=True,
-        fancybox=True,
-        framealpha=0.86,
-        borderpad=0.35,
-        handletextpad=0.4,
-        labelspacing=0.25,
-    )
-    leg.get_frame().set_edgecolor("#D0D0D0")
-    leg.get_frame().set_linewidth(0.4)
-
-    ax.text(
-        0.986, 0.018, f"OSM z{zoom} · © OpenStreetMap contributors",
-        transform=ax.transAxes, ha="right", va="bottom", fontsize=5.1, color=GRIS_OSCURO,
-        bbox={"boxstyle": "round,pad=0.13", "fc": "white", "ec": "none", "alpha": 0.82},
-        zorder=8,
-    )
-
-    fig.savefig(ruta, dpi=MAP_DPI, facecolor="white")
-    plt.close(fig)
-    try:
-        basemap.close()
-    except Exception:
-        pass
-    del basemap
+        punto=_shape_point_3857(evento.get('_geometry'))
+        if punto is not None: registros.append((punto[0],punto[1],evento))
+    if not registros: return False
+    contexto=[(x,y) for x,y,_ in registros]; contexto.extend(_vertices_corredor(corredores_activos))
+    W,H=SUMMARY_MAP_TARGET_PIXELS
+    extent=_ajustar_extension_mapa_3857(contexto,aspecto_panel=W/H,margen=1.06,span_minimo_m=250000.0)
+    basemap,basemap_extent,zoom=descargar_mosaico_osm(extent)
+    _validar_registro_osm_shape(registros,basemap_extent,basemap)
+    canvas=_recortar_osm_a_extent(basemap,basemap_extent,extent,(W,H)); basemap.close(); del basemap
+    d=ImageDraw.Draw(canvas); box=(0,0,W-1,H-1)
+    _dibujar_corredor_pil(d,corredores_activos,extent,box,width=3)
+    clusters=_agrupar_eventos_proximidad(registros,SUMMARY_CLUSTER_RADIUS_M)
+    fnum=_pil_font(10,True)
+    for c in clusters:
+        px,py=_xy_a_pixel(c['x'],c['y'],extent,box); n=c['n']; r=7 if n==1 else min(16,9+int(math.sqrt(n)*2))
+        d.ellipse((px-r-2,py-r-2,px+r+2,py+r+2),fill='white')
+        d.ellipse((px-r,py-r,px+r,py+r),fill=ROJO)
+        if n>1:
+            tw,th=_text_size(d,str(n),fnum); d.text((px-tw/2,py-th/2-1),str(n),font=fnum,fill='white')
+    # estadísticas en caja compacta
+    deps=Counter(normalizar_departamento(e.get('departamento')) for e in eventos); top=deps.most_common(3)
+    ngr=sum(1 for c in clusters if c['n']>1); mx=max((c['n'] for c in clusters),default=1)
+    lines=[f'{len(registros)} eventos · {ngr} agrupaciones · máx. {mx}/grupo']
+    if top: lines.append('Mayor presencia: '+', '.join(f'{dpt} ({n})' for dpt,n in top))
+    fs=_pil_font(9); pad=6; widths=[_text_size(d,l,fs)[0] for l in lines]; bw=max(widths)+2*pad; bh=15*len(lines)+2*pad
+    d.rounded_rectangle((7,7,7+bw,7+bh),radius=4,fill='white',outline='#D0D0D0')
+    yy=11
+    for line in lines: d.text((13,yy),line,font=fs,fill=GRIS_OSCURO); yy+=15
+    osm=f'OSM z{zoom} · © OpenStreetMap contributors'; tw,_=_text_size(d,osm,fs); d.rectangle((W-tw-9,H-20,W-3,H-3),fill='white'); d.text((W-tw-6,H-18),osm,font=fs,fill=GRIS_OSCURO)
+    # mini-leyenda
+    y=H-45; d.line((10,y+6,30,y+6),fill='#F36C21',width=3); d.text((35,y),'Corredor',font=fs,fill=GRIS_OSCURO)
+    d.ellipse((108,y,120,y+12),fill=ROJO,outline='white'); d.text((125,y),'Evento / agrupación',font=fs,fill=GRIS_OSCURO)
+    _save_pil(canvas,ruta)
+    del registros, contexto, clusters
     gc.collect()
     return True
 
@@ -2392,7 +2067,7 @@ def generar_reporte(eventos):
             "tipo_cierre": tmp / "tipo_cierre.png",
             "impacto": tmp / "impacto.png",
         }
-        summary_map_path = tmp / "mapa_resumen_general.jpg"
+        summary_map_path = tmp / "mapa_resumen_general.png"
 
         grafica_corredores(eventos, chart_paths["corredores"])
         grafica_tipo_evento(eventos, chart_paths["tipo_evento"])
@@ -2437,7 +2112,7 @@ def generar_reporte(eventos):
             if corredor_name:
                 nombres_corredor_resumen.add(corredor_name)
 
-            ruta_mapa = tmp / f"mapa_corredor_{indice:02d}.jpg"
+            ruta_mapa = tmp / f"mapa_corredor_{indice:02d}.png"
             if mapa_eventos_corredor(
                 lista_eventos,
                 ruta_mapa,
@@ -2448,7 +2123,7 @@ def generar_reporte(eventos):
             ):
                 mapas_corredor[corredor_raw] = ruta_mapa
 
-            # La geometría detallada ya quedó rasterizada en el JPG del mapa.
+            # La geometría detallada ya quedó rasterizada en el PNG del mapa.
             # No debe permanecer en RAM durante el resto del reporte.
             del corredor_features
             gc.collect()
