@@ -15,6 +15,13 @@ Integra en un solo PDF:
 Requisitos:
     pip install requests reportlab matplotlib pillow
 
+Perfil V14 Render512:
+- reduce resolución raster a la necesaria para media página;
+- generaliza únicamente CorredorWaze en el servidor;
+- libera tiles, mosaicos y geometrías inmediatamente;
+- evita mantener simultáneamente geometría ArcGIS y paths duplicados;
+- fuerza garbage collection entre mapas/gráficas.
+
 Archivo requerido en la misma carpeta:
     logo_mintransporte.png
 """
@@ -30,11 +37,19 @@ import math
 import tempfile
 import time
 import textwrap
+import gc
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+
+# Perfil de renderizado de bajo consumo para Render Free (512 MB).
+# Matplotlib documenta que simplificar paths y trocear líneas grandes reduce
+# el trabajo del backend Agg al dibujar geometrías densas.
+matplotlib.rcParams["path.simplify"] = True
+matplotlib.rcParams["path.simplify_threshold"] = 0.55
+matplotlib.rcParams["agg.path.chunksize"] = 20000
 import requests
 from PIL import Image as PILImage
 
@@ -90,8 +105,11 @@ EXPECTED_CORRIDOR_GEOMETRY_TYPE = "esriGeometryPolyline"
 # Resumen cartográfico. La agrupación es solo visual y no mueve los Shape
 # originales en los mapas detallados. 50 km funciona como escala nacional.
 SUMMARY_CLUSTER_RADIUS_M = 50_000.0
-SUMMARY_MAP_FIGSIZE = (5.0, 3.85)
-SUMMARY_MAP_TARGET_PIXELS = (1000, 770)
+# Perfil de imágenes reducido: el mapa del resumen se inserta en un recuadro
+# pequeño del PDF, por lo que 720x520 px conserva nitidez suficiente sin
+# mantener buffers raster innecesariamente grandes en memoria.
+SUMMARY_MAP_FIGSIZE = (5.0, 3.6)
+SUMMARY_MAP_TARGET_PIXELS = (720, 520)
 
 # OpenStreetMap estándar. La política oficial exige usar este host,
 # identificar la aplicación y mostrar atribución visible en cada mapa.
@@ -100,11 +118,11 @@ OSM_USER_AGENT = "MinTransporte-ReporteSemanalEventos/8.0 (Grupo de Logistica)"
 OSM_CACHE_DIR = BASE_DIR / ".osm_tile_cache"
 OSM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 OSM_CACHE_TTL_SECONDS = 7 * 24 * 60 * 60
-OSM_MAX_TILES_PER_MAP = 30
+OSM_MAX_TILES_PER_MAP = 16
 OSM_TILE_SIZE = 256
 # Solicita un nivel adicional de detalle cuando el número de tiles lo permite.
 # Si supera OSM_MAX_TILES_PER_MAP, el algoritmo reduce el zoom automáticamente.
-OSM_DETAIL_ZOOM_BONUS = 1
+OSM_DETAIL_ZOOM_BONUS = 0
 
 # OpenStreetMap usa Web Mercator. Se consulta el Feature Service en 3857 para
 # dibujar exactamente la geometría Shape devuelta por el servicio, sin
@@ -116,8 +134,19 @@ EXPECTED_GEOMETRY_TYPE = "esriGeometryPoint"
 STRICT_GEOMETRY_VALIDATION = True
 
 # Todos los mapas del PDF usan exactamente el mismo tamaño/aspecto.
-MAP_FIGSIZE = (7.6, 4.9)
-MAP_TARGET_PIXELS = (1400, 850)
+# El mapa ocupa aproximadamente media página en el PDF. 900x560 px ya ofrece
+# una densidad visual alta en ese tamaño, mientras reduce de forma importante
+# los buffers RGBA de Matplotlib frente a 1400x850/200 dpi.
+MAP_FIGSIZE = (7.2, 4.45)
+MAP_TARGET_PIXELS = (900, 560)
+CHART_DPI = 125
+MAP_DPI = 125
+
+# Generalización visual de CorredorWaze. outSR=3857 usa metros, por lo que el
+# servidor puede reducir vértices antes de enviar la geometría. Los eventos NO
+# se generalizan ni se mueven.
+CORRIDOR_DETAIL_OFFSET_M = 25.0
+CORRIDOR_SUMMARY_OFFSET_M = 250.0
 MAP_PANEL_ASPECT = MAP_TARGET_PIXELS[0] / MAP_TARGET_PIXELS[1]
 
 COLOMBIA_TZ = timezone(timedelta(hours=-5))
@@ -447,7 +476,7 @@ def nombre_corredor_waze(corredor_raw):
     return limpiar(corredor_raw, ""), False
 
 
-def consultar_corredor_waze_por_name(nombre):
+def consultar_corredor_waze_por_name(nombre, max_allowable_offset=CORRIDOR_DETAIL_OFFSET_M):
     """
     Consulta únicamente las entidades de CorredorWaze cuyo campo Name coincide
     exactamente con el corredor actual. Devuelve TODOS los segmentos recibidos
@@ -469,6 +498,10 @@ def consultar_corredor_waze_por_name(nombre):
         "returnZ": "false",
         "returnM": "false",
         "resultRecordCount": 2000,
+        # Reduce vértices en el servidor antes de transferirlos. En EPSG:3857
+        # el valor se interpreta en metros.
+        "maxAllowableOffset": float(max_allowable_offset),
+        "geometryPrecision": 1,
     }
 
     resp = requests.get(
@@ -491,10 +524,12 @@ def consultar_corredor_waze_por_name(nombre):
         paths = _paths_corredor_3857(geometry)
         if not paths:
             continue
+        # No conservamos geometry Y paths simultáneamente: ambos contienen la
+        # misma geometría y duplicaban memoria. Para dibujar solo necesitamos
+        # la versión normalizada en paths.
         segmentos.append({
             "OBJECTID": attrs.get("OBJECTID"),
             "Name": attrs.get(CORRIDOR_NAME_FIELD) or nombre,
-            "geometry": geometry,
             "paths": paths,
         })
 
@@ -617,11 +652,11 @@ def grafica_corredores(eventos, ruta):
     fig.tight_layout(rect=[0, 0.19, 1, 1])
     fig.savefig(
         ruta,
-        dpi=175,
-        bbox_inches="tight",
+        dpi=CHART_DPI,
         facecolor="white",
     )
     plt.close(fig)
+    gc.collect()
 
 
 def grafica_tipo_evento(eventos, ruta):
@@ -655,8 +690,9 @@ def grafica_tipo_evento(eventos, ruta):
     )
 
     fig.tight_layout(rect=[0, 0.18, 1, 1])
-    fig.savefig(ruta, dpi=170, bbox_inches="tight", facecolor="white")
+    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
     plt.close(fig)
+    gc.collect()
 
 
 def grafica_tipo_cierre(eventos, ruta):
@@ -690,8 +726,9 @@ def grafica_tipo_cierre(eventos, ruta):
     )
 
     fig.tight_layout(rect=[0, 0.18, 1, 1])
-    fig.savefig(ruta, dpi=170, bbox_inches="tight", facecolor="white")
+    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
     plt.close(fig)
+    gc.collect()
 
 
 def grafica_impacto(eventos, ruta):
@@ -740,8 +777,9 @@ def grafica_impacto(eventos, ruta):
 
     ax.set_xlim(0, max(valores) * 1.18)
     fig.tight_layout()
-    fig.savefig(ruta, dpi=170, bbox_inches="tight", facecolor="white")
+    fig.savefig(ruta, dpi=CHART_DPI, facecolor="white")
     plt.close(fig)
+    gc.collect()
 
 
 def grafica_departamentos_corredor(eventos_corredor, ruta, nombre_corredor):
@@ -852,12 +890,11 @@ def grafica_departamentos_corredor(eventos_corredor, ruta, nombre_corredor):
     fig.tight_layout(rect=[0.015, 0.18, 0.985, 0.98])
     fig.savefig(
         ruta,
-        dpi=190,
-        bbox_inches="tight",
+        dpi=CHART_DPI,
         facecolor="white",
-        pad_inches=0.05,
     )
     plt.close(fig)
+    gc.collect()
 
 
 # ============================================================
@@ -1034,7 +1071,15 @@ def descargar_mosaico_osm(extent):
         for fila, y in enumerate(range(y0, y1 + 1)):
             for col, x in enumerate(range(x0, x1 + 1)):
                 tile = _descargar_tile_osm(zoom, x, y, session)
-                mosaico.paste(tile, (col * OSM_TILE_SIZE, fila * OSM_TILE_SIZE))
+                try:
+                    mosaico.paste(tile, (col * OSM_TILE_SIZE, fila * OSM_TILE_SIZE))
+                finally:
+                    # Libera de inmediato el buffer del tile; el mosaico ya tiene
+                    # una copia de sus píxeles.
+                    try:
+                        tile.close()
+                    except Exception:
+                        pass
 
     n = 2 ** zoom
     mundo = 2.0 * WEB_MERCATOR_HALF_WORLD
@@ -1353,8 +1398,14 @@ def mapa_eventos_corredor(
         zorder=8,
     )
 
-    fig.savefig(ruta, dpi=200, facecolor="white", bbox_inches="tight", pad_inches=0.03)
+    fig.savefig(ruta, dpi=MAP_DPI, facecolor="white")
     plt.close(fig)
+    try:
+        basemap.close()
+    except Exception:
+        pass
+    del basemap
+    gc.collect()
 
     print(
         f"Mapa {nombre_corredor}: {len(registros)} evento(s), "
@@ -1536,8 +1587,14 @@ def mapa_resumen_general(eventos, corredores_activos, ruta):
         zorder=8,
     )
 
-    fig.savefig(ruta, dpi=200, facecolor="white", bbox_inches="tight", pad_inches=0.03)
+    fig.savefig(ruta, dpi=MAP_DPI, facecolor="white")
     plt.close(fig)
+    try:
+        basemap.close()
+    except Exception:
+        pass
+    del basemap
+    gc.collect()
     return True
 
 
@@ -2335,7 +2392,7 @@ def generar_reporte(eventos):
             "tipo_cierre": tmp / "tipo_cierre.png",
             "impacto": tmp / "impacto.png",
         }
-        summary_map_path = tmp / "mapa_resumen_general.png"
+        summary_map_path = tmp / "mapa_resumen_general.jpg"
 
         grafica_corredores(eventos, chart_paths["corredores"])
         grafica_tipo_evento(eventos, chart_paths["tipo_evento"])
@@ -2352,7 +2409,10 @@ def generar_reporte(eventos):
 
         chart_departamentos = {}
         mapas_corredor = {}
-        corredores_activos = []
+        # No retenemos todas las geometrías detalladas hasta el final: cada
+        # corredor se libera tras generar su mapa. El resumen se consulta luego
+        # con una geometría más generalizada y liviana.
+        nombres_corredor_resumen = set()
         for indice, (corredor_raw, lista_eventos) in enumerate(
             sorted(
                 eventos_por_corredor.items(),
@@ -2370,10 +2430,14 @@ def generar_reporte(eventos):
 
             # Filtro directo de CorredorWaze por el campo Name del corredor actual.
             corredor_name, cobertura_parcial = nombre_corredor_waze(corredor_raw)
-            corredor_features = consultar_corredor_waze_por_name(corredor_name)
-            corredores_activos.extend(corredor_features)
+            corredor_features = consultar_corredor_waze_por_name(
+                corredor_name,
+                max_allowable_offset=CORRIDOR_DETAIL_OFFSET_M,
+            )
+            if corredor_name:
+                nombres_corredor_resumen.add(corredor_name)
 
-            ruta_mapa = tmp / f"mapa_corredor_{indice:02d}.png"
+            ruta_mapa = tmp / f"mapa_corredor_{indice:02d}.jpg"
             if mapa_eventos_corredor(
                 lista_eventos,
                 ruta_mapa,
@@ -2384,10 +2448,28 @@ def generar_reporte(eventos):
             ):
                 mapas_corredor[corredor_raw] = ruta_mapa
 
-        # El mapa del resumen reutiliza exactamente los segmentos que ya fueron
-        # consultados por Name para los corredores presentes en el reporte.
-        if not mapa_resumen_general(eventos, corredores_activos, summary_map_path):
+            # La geometría detallada ya quedó rasterizada en el JPG del mapa.
+            # No debe permanecer en RAM durante el resto del reporte.
+            del corredor_features
+            gc.collect()
+
+        # Para el mapa nacional se vuelven a consultar únicamente los corredores
+        # activos con una generalización mayor. Esto sacrifica vértices que no son
+        # visibles a esa escala, no la ubicación de los eventos.
+        corredores_resumen = []
+        for nombre_resumen in sorted(nombres_corredor_resumen, key=str.casefold):
+            corredores_resumen.extend(
+                consultar_corredor_waze_por_name(
+                    nombre_resumen,
+                    max_allowable_offset=CORRIDOR_SUMMARY_OFFSET_M,
+                )
+            )
+
+        if not mapa_resumen_general(eventos, corredores_resumen, summary_map_path):
             summary_map_path = None
+
+        del corredores_resumen
+        gc.collect()
 
         story = []
 
