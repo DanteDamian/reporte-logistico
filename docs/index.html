@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reporte Carretero – Generando</title>
+<style>
+  :root{
+    --naranja:#F47B20; --azul:#0B2D5B; --verde:#1E9E4A; --rojo:#C8102E;
+    --gris:#6B7280; --fondo:#F4F6F9; --card:#FFFFFF; --linea:#E5E7EB;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+       font-family:"Segoe UI",Roboto,Arial,sans-serif;background:var(--fondo);color:#1F2937;padding:16px}
+  .card{background:var(--card);width:100%;max-width:520px;border-radius:14px;
+        box-shadow:0 10px 30px rgba(11,45,91,.12);overflow:hidden}
+  .top{background:linear-gradient(90deg,var(--azul),#1B4F9C);color:#fff;padding:18px 24px}
+  .top h1{margin:0;font-size:18px;font-weight:600}
+  .top p{margin:4px 0 0;font-size:13px;opacity:.85}
+  .body{padding:24px}
+  .step{display:flex;gap:14px;align-items:flex-start;padding:12px 0;border-bottom:1px solid var(--linea)}
+  .step:last-child{border-bottom:none}
+  .icon{flex:0 0 28px;height:28px;border-radius:50%;border:2px solid var(--linea);
+        display:flex;align-items:center;justify-content:center;font-size:14px;color:var(--gris)}
+  .step.activo .icon{border-color:var(--naranja);border-top-color:transparent;animation:gira 0.9s linear infinite}
+  .step.hecho .icon{background:var(--verde);border-color:var(--verde);color:#fff}
+  .step.falla .icon{background:var(--rojo);border-color:var(--rojo);color:#fff}
+  .step h3{margin:2px 0 2px;font-size:15px;font-weight:600}
+  .step p{margin:0;font-size:13px;color:var(--gris)}
+  .step:not(.activo):not(.hecho):not(.falla) h3{color:#9CA3AF}
+  @keyframes gira{to{transform:rotate(360deg)}}
+  .barra{height:6px;background:var(--linea);border-radius:3px;margin:18px 0 6px;overflow:hidden}
+  .barra div{height:100%;width:0;background:var(--naranja);transition:width .6s ease}
+  .tiempo{font-size:12px;color:var(--gris);text-align:right}
+  .acciones{margin-top:18px;display:none;gap:10px;flex-wrap:wrap}
+  .acciones.ver{display:flex}
+  button,a.btn{border:none;border-radius:8px;padding:10px 18px;font-size:14px;font-weight:600;
+               cursor:pointer;text-decoration:none;display:inline-block}
+  .primario{background:var(--naranja);color:#fff}
+  .secundario{background:#fff;color:var(--azul);border:1px solid var(--linea)!important}
+  .msg{margin-top:14px;font-size:13px;padding:10px 12px;border-radius:8px;display:none}
+  .msg.error{display:block;background:#FDECEE;color:var(--rojo)}
+  .msg.info{display:block;background:#FFF4EB;color:#9A4A0B}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="top">
+    <h1>Reporte Carretero · Grupo Logística</h1>
+    <p>Estamos preparando su reporte semanal en PDF. No cierre esta ventana.</p>
+  </div>
+  <div class="body">
+    <div class="step" id="s1"><div class="icon">1</div><div>
+      <h3>Conectando con el servidor</h3>
+      <p id="s1p">El servidor se activa bajo demanda; puede tardar hasta 1 minuto.</p></div></div>
+    <div class="step" id="s2"><div class="icon">2</div><div>
+      <h3>Consultando eventos y armando el reporte</h3>
+      <p id="s2p">Se leen los incidentes y se genera el documento.</p></div></div>
+    <div class="step" id="s3"><div class="icon">3</div><div>
+      <h3>Descargando PDF</h3>
+      <p id="s3p">El archivo se descargará automáticamente.</p></div></div>
+
+    <div class="barra"><div id="barra"></div></div>
+    <div class="tiempo" id="tiempo">0 s</div>
+
+    <div class="msg" id="msg"></div>
+    <div class="acciones" id="acciones">
+      <a class="btn primario" id="btnAbrir" target="_blank" rel="noopener">Abrir PDF</a>
+      <button class="secundario" id="btnReintentar">Generar de nuevo</button>
+      <button class="secundario" onclick="window.close()">Cerrar</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===== Configuración ===== */
+const API = "https://reporte-logistico.onrender.com";   // URL del servicio en Render
+const MAX_DESPERTAR_S = 180;   // tiempo máximo esperando que el servidor despierte
+const MAX_REPORTE_S   = 600;   // tiempo máximo esperando la generación del PDF
+const NOMBRE_PDF = "Reporte_Semanal_Eventos_Logisticos.pdf";
+
+/* ===== Utilidades ===== */
+const $ = id => document.getElementById(id);
+const dormir = ms => new Promise(r => setTimeout(r, ms));
+const t0 = Date.now();
+const reloj = setInterval(() => { $("tiempo").textContent = Math.round((Date.now()-t0)/1000) + " s"; }, 1000);
+
+function paso(n, estado, texto){
+  const s = $("s"+n);
+  s.classList.remove("activo","hecho","falla");
+  if (estado) s.classList.add(estado);
+  s.querySelector(".icon").textContent = estado==="hecho" ? "✓" : estado==="falla" ? "!" : (estado==="activo" ? "" : n);
+  if (texto) $("s"+n+"p").textContent = texto;
+}
+function progreso(p){ $("barra").style.width = Math.min(100,p) + "%"; }
+function mensaje(tipo, texto){ const m=$("msg"); m.className="msg "+tipo; m.textContent=texto; }
+
+async function fetchJson(url, opts={}, timeoutMs=10000){
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  try{
+    const r = await fetch(url, {...opts, signal: ctrl.signal, cache: "no-store"});
+    const ct = r.headers.get("content-type") || "";
+    if (!ct.includes("application/json")) throw new Error("respuesta no JSON (servidor aún despertando)");
+    const data = await r.json();
+    if (!r.ok) throw Object.assign(new Error(data.detail || r.statusText), {status:r.status});
+    return data;
+  } finally { clearTimeout(id); }
+}
+
+/* ===== 1. Despertar el servidor ===== */
+async function despertar(){
+  paso(1,"activo");
+  const inicio = Date.now();
+  let intento = 0;
+  while ((Date.now()-inicio)/1000 < MAX_DESPERTAR_S){
+    intento++;
+    try{
+      const d = await fetchJson(API + "/health", {}, 8000);
+      if (d.status === "ok"){ paso(1,"hecho","Servidor activo."); progreso(30); return; }
+    }catch(e){ /* Render muestra su página de arranque o no hay CORS todavía: seguimos esperando */ }
+    const seg = Math.round((Date.now()-inicio)/1000);
+    $("s1p").textContent = seg < 15
+      ? "Verificando disponibilidad…"
+      : `Activando el servidor (${seg} s). Esto solo ocurre si nadie lo ha usado recientemente.`;
+    progreso(Math.min(28, 5 + seg/MAX_DESPERTAR_S*25));
+    await dormir(3000);
+  }
+  throw new Error("El servidor no respondió a tiempo. Intente de nuevo en un minuto.");
+}
+
+/* ===== 2. Crear (o reutilizar) el trabajo y esperar ===== */
+async function generar(){
+  paso(2,"activo");
+  const job = await fetchJson(API + "/reportes", {method:"POST"}, 20000);
+  if (job.reutilizado) $("s2p").textContent = "Ya había un reporte en curso; esperando ese mismo resultado.";
+  const inicio = Date.now();
+  while ((Date.now()-inicio)/1000 < MAX_REPORTE_S){
+    await dormir(2500);
+    let e;
+    try { e = await fetchJson(`${API}/reportes/${job.job_id}`, {}, 10000); }
+    catch(err){ if (err.status === 404) throw new Error("El servidor se reinició y perdió el trabajo. Genere de nuevo."); continue; }
+    if (e.estado === "listo"){ paso(2,"hecho","Reporte generado."); progreso(85); return job.job_id; }
+    if (e.estado === "error") throw new Error("Error generando el reporte: " + (e.error || "desconocido"));
+    const seg = Math.round((Date.now()-inicio)/1000);
+    $("s2p").textContent = e.mensaje || `Procesando (${seg} s)…`;
+    progreso(30 + Math.min(50, seg/60*50));
+  }
+  throw new Error("La generación tardó más de lo esperado.");
+}
+
+/* ===== 3. Descargar ===== */
+async function descargar(jobId){
+  paso(3,"activo");
+  const url = `${API}/reportes/${jobId}/pdf`;
+  $("btnAbrir").href = url;
+  try{
+    const r = await fetch(url, {cache:"no-store"});
+    if (!r.ok) throw new Error();
+    const blob = await r.blob();
+    const local = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = local; a.download = NOMBRE_PDF; document.body.appendChild(a); a.click(); a.remove();
+    $("btnAbrir").href = local;
+  }catch(e){
+    window.location.href = url;   // plan B: navegación directa
+  }
+  paso(3,"hecho","Descarga iniciada. Si no aparece, use el botón «Abrir PDF».");
+  progreso(100);
+  mensaje("info","Listo. Puede cerrar esta ventana.");
+  $("acciones").classList.add("ver");
+}
+
+/* ===== Flujo ===== */
+async function iniciar(){
+  $("acciones").classList.remove("ver"); $("msg").className="msg";
+  [1,2,3].forEach(n => paso(n,null)); progreso(2);
+  try{
+    await despertar();
+    const id = await generar();
+    await descargar(id);
+  }catch(e){
+    document.querySelectorAll(".step.activo").forEach(s => { s.classList.replace("activo","falla"); s.querySelector(".icon").textContent="!"; });
+    mensaje("error", e.message);
+    $("btnAbrir").style.display = "none";
+    $("acciones").classList.add("ver");
+  }finally{
+    clearInterval(reloj);
+  }
+}
+$("btnReintentar").onclick = () => location.reload();
+iniciar();
+</script>
+</body>
+</html>
