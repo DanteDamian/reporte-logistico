@@ -65,6 +65,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from ocupacion_portuaria import consultar_ocupacion, graficas_ocupacion
 
 
 # ============================================================
@@ -402,7 +403,7 @@ def consultar_eventos_abiertos():
         eventos.append(atributos)
 
     if not eventos:
-        raise RuntimeError("La consulta no devolvió eventos abiertos.")
+        print("No hay eventos abiertos; se continuará con la ocupación portuaria.")
 
     if geometrias_invalidas and STRICT_GEOMETRY_VALIDATION:
         ids = ", ".join(str(x) for x in geometrias_invalidas[:20])
@@ -2008,11 +2009,13 @@ def pagina_detalle(canvas, doc):
 # CONSTRUCCIÓN DEL PDF
 # ============================================================
 
-def generar_reporte(eventos):
+def generar_reporte(eventos, ocupacion=None):
     if not LOGO.exists():
         raise FileNotFoundError(f"No se encontró el logo: {LOGO}")
 
     fecha_corte = datetime.now(COLOMBIA_TZ)
+    if ocupacion is None:
+        ocupacion = consultar_ocupacion(fecha_corte)
     nombre = f"Reporte_Logistico_Institucional_{fecha_corte.strftime('%Y%m%d_%H%M')}.pdf"
     ruta_pdf = OUTPUT_DIR / nombre
 
@@ -2157,6 +2160,39 @@ def generar_reporte(eventos):
         story.append(ResumenFlowable(eventos, fecha_corte, chart_paths, summary_map_path))
         story.append(NextPageTemplate("detalle"))
         story.append(PageBreak())
+
+        # Vista_Ocupacion es una segunda fuente independiente. Se representa en
+        # dos páginas antes del detalle por corredor, con el mismo corte diario.
+        registros_puerto, inicio_puerto, fin_puerto = ocupacion
+        graficas_puerto = graficas_ocupacion(registros_puerto, inicio_puerto, fin_puerto, tmp)
+        for componente, clave in (("Terminales", "terminal"), ("Patios de contenedores", "patio")):
+            barras, serie, valores, zonas = graficas_puerto[clave]
+            story.append(Paragraph(f"Ocupación portuaria · {componente}", estilos["h1"]))
+            story.append(Spacer(1, 0.30 * cm))
+            story.append(Paragraph(
+                f"Período: {inicio_puerto:%d/%m/%Y}–{fin_puerto:%d/%m/%Y} "
+                f"(hora Colombia). Zonas con datos: {zonas}. "
+                f"Promedio de grupos diarios: {sum(valores)/len(valores):.1f} %".replace(".", ",")
+                if valores else
+                f"Período: {inicio_puerto:%d/%m/%Y}–{fin_puerto:%d/%m/%Y} "
+                "(hora Colombia). Sin registros para este componente.",
+                estilos["campo"],
+            ))
+            story.append(Spacer(1, 0.24 * cm))
+            story.append(Paragraph("Último registro disponible por zona", estilos["seccion"]))
+            story.append(Image(str(barras), width=17.2 * cm, height=8.45 * cm))
+            story.append(Spacer(1, 0.26 * cm))
+            story.append(Paragraph("Distribución en el tiempo", estilos["seccion"]))
+            story.append(Image(str(serie), width=17.2 * cm, height=9.06 * cm))
+            story.append(Spacer(1, 0.25 * cm))
+            story.append(Paragraph(
+                "Las barras muestran el último día disponible para cada zona. Cada punto es "
+                "el promedio de las unidades que reportaron ese día; un día sin datos queda "
+                "sin punto. Si una unidad reportó varias veces, se usa su última edición. "
+                "Se conservan los valores superiores al 100 % registrados en la fuente.",
+                estilos["campo"],
+            ))
+            story.append(PageBreak())
 
         # Página 3 en adelante - Detalle
         agrupados = defaultdict(lambda: defaultdict(list))

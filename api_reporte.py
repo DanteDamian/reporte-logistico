@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from ReporteSemanalV13 import OUTPUT_DIR, consultar_eventos_abiertos, generar_reporte
+from ocupacion_portuaria import consultar_ocupacion
 
 app = FastAPI(
     title="Reporte Semanal de Eventos Logísticos",
@@ -75,9 +76,13 @@ def _ejecutar(job_id: str):
         log(f"Eventos consultados: {len(eventos)}")
         _log_memoria("después de consulta")
 
-        trabajo["mensaje"] = f"Generando PDF con {len(eventos)} eventos (mapas y gráficas)…"
+        trabajo["mensaje"] = "Consultando ocupación portuaria de los últimos siete días…"
+        ocupacion = consultar_ocupacion()
+        log(f"Registros de ocupación consultados: {len(ocupacion[0])}")
+
+        trabajo["mensaje"] = f"Generando PDF con {len(eventos)} eventos y ocupación portuaria…"
         log("Generando PDF con mapas/gráficas Pillow...")
-        ruta_pdf = Path(generar_reporte(eventos))
+        ruta_pdf = Path(generar_reporte(eventos, ocupacion))
         if not ruta_pdf.exists():
             raise RuntimeError(f"No se encontró el PDF generado: {ruta_pdf}")
 
