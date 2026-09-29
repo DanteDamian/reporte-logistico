@@ -65,6 +65,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from ocupacion_portuaria import consultar_ocupacion, graficas_ocupacion
 
 
 # ============================================================
@@ -402,7 +403,7 @@ def consultar_eventos_abiertos():
         eventos.append(atributos)
 
     if not eventos:
-        raise RuntimeError("La consulta no devolvió eventos abiertos.")
+        print("No hay eventos abiertos; se continuará con la ocupación portuaria.")
 
     if geometrias_invalidas and STRICT_GEOMETRY_VALIDATION:
         ids = ", ".join(str(x) for x in geometrias_invalidas[:20])
@@ -1411,6 +1412,45 @@ class PortadaFlowable(Flowable):
         c.drawCentredString(ancho / 2, 0.40 * cm, "MINISTERIO DE TRANSPORTE")
 
 
+class EncabezadoSeccionFlowable(Flowable):
+    """Encabezado institucional de las secciones posteriores al resumen vial."""
+
+    def __init__(self, titulo, fecha_corte):
+        super().__init__()
+        self.titulo = titulo
+        self.fecha_corte = fecha_corte
+        self.width = 17.2 * cm
+        self.height = 2.80 * cm
+
+    def wrap(self, availWidth, availHeight):
+        return self.width, self.height
+
+    def draw(self):
+        c = self.canv
+        logo = ImageReader(str(LOGO))
+        iw, ih = logo.getSize()
+        dw = 2.95 * cm
+        dh = dw * ih / iw
+        x_texto = 3.25 * cm
+        c.drawImage(logo, 0, 0.52 * cm, width=dw, height=dh,
+                    preserveAspectRatio=True, mask="auto")
+        c.setFillColor(colors.HexColor(NARANJA))
+        c.setFont("Helvetica-Bold", 18)
+        c.drawString(x_texto, 1.78 * cm, self.titulo)
+        c.setFillColor(colors.HexColor(GRIS_OSCURO))
+        c.setFont("Helvetica", 8.2)
+        c.drawString(x_texto, 1.11 * cm, "Reporte semanal de eventos logísticos")
+        c.drawRightString(self.width, 1.11 * cm,
+                          f"Corte: {self.fecha_corte:%d/%m/%Y %H:%M}")
+        for inicio, ancho_color, color in (
+            (0, 2.3 * cm, AMARILLO),
+            (2.3 * cm, 1.3 * cm, AZUL),
+            (3.6 * cm, 0.65 * cm, ROJO),
+        ):
+            c.setFillColor(colors.HexColor(color))
+            c.rect(x_texto + inicio, 0.88 * cm, ancho_color, 2.4, fill=1, stroke=0)
+
+
 class ResumenFlowable(Flowable):
     def __init__(self, eventos, fecha_corte, chart_paths, summary_map_path=None):
         super().__init__()
@@ -1451,7 +1491,7 @@ class ResumenFlowable(Flowable):
 
         c.setFillColor(colors.HexColor(NARANJA))
         c.setFont("Helvetica-Bold", 20)
-        c.drawString(145, alto - 68, "RESUMEN EJECUTIVO")
+        c.drawString(145, alto - 68, "RESUMEN EJECUTIVO VIAL")
 
         c.setFillColor(colors.HexColor(GRIS))
         c.setFont("Helvetica", 9)
@@ -2008,11 +2048,13 @@ def pagina_detalle(canvas, doc):
 # CONSTRUCCIÓN DEL PDF
 # ============================================================
 
-def generar_reporte(eventos):
+def generar_reporte(eventos, ocupacion=None):
     if not LOGO.exists():
         raise FileNotFoundError(f"No se encontró el logo: {LOGO}")
 
     fecha_corte = datetime.now(COLOMBIA_TZ)
+    if ocupacion is None:
+        ocupacion = consultar_ocupacion(fecha_corte)
     nombre = f"Reporte_Logistico_Institucional_{fecha_corte.strftime('%Y%m%d_%H%M')}.pdf"
     ruta_pdf = OUTPUT_DIR / nombre
 
@@ -2158,6 +2200,43 @@ def generar_reporte(eventos):
         story.append(NextPageTemplate("detalle"))
         story.append(PageBreak())
 
+        # Vista_Ocupacion es una segunda fuente independiente. Se representa en
+        # dos páginas antes del detalle por corredor, con el mismo corte diario.
+        registros_puerto, inicio_puerto, fin_puerto = ocupacion
+        graficas_puerto = graficas_ocupacion(registros_puerto, inicio_puerto, fin_puerto, tmp)
+        for componente, clave in (("Terminales", "terminal"), ("Patios de contenedores", "patio")):
+            barras, serie, valores, zonas_ultimo_dia, zonas_semana = graficas_puerto[clave]
+            story.append(EncabezadoSeccionFlowable("RESUMEN EJECUTIVO PORTUARIO", fecha_corte))
+            story.append(Paragraph(componente, estilos["h1"]))
+            story.append(Spacer(1, 0.12 * cm))
+            story.append(Paragraph(
+                f"Período: {inicio_puerto:%d/%m/%Y}–{fin_puerto:%d/%m/%Y} "
+                f"(hora Colombia). Zonas en la semana: {zonas_semana}; "
+                f"en el último día: {zonas_ultimo_dia}. "
+                f"Promedio del último día con datos: {sum(valores)/len(valores):.1f} %".replace(".", ",")
+                if valores else
+                f"Período: {inicio_puerto:%d/%m/%Y}–{fin_puerto:%d/%m/%Y} "
+                "(hora Colombia). Sin registros para este componente.",
+                estilos["campo"],
+            ))
+            story.append(Spacer(1, 0.24 * cm))
+            story.append(Paragraph("Último día disponible: zonas y operaciones", estilos["seccion"]))
+            with PILImage.open(barras) as imagen_barras:
+                alto_barras = min(8.45 * cm, 17.2 * cm * imagen_barras.height / imagen_barras.width)
+            story.append(Image(str(barras), width=17.2 * cm, height=alto_barras))
+            story.append(Spacer(1, 0.26 * cm))
+            story.append(Paragraph("Distribución en el tiempo", estilos["seccion"]))
+            story.append(Image(str(serie), width=17.2 * cm, height=9.06 * cm))
+            story.append(Spacer(1, 0.25 * cm))
+            story.append(Paragraph(
+                "Las barras comparan zonas en un mismo día de corte. Cada punto "
+                "es el promedio de los reportes del día por operación en terminales "
+                "y por zona en patios; un día sin datos queda sin punto. "
+                "Se conservan los valores superiores al 100 % registrados en la fuente.",
+                estilos["campo"],
+            ))
+            story.append(PageBreak())
+
         # Página 3 en adelante - Detalle
         agrupados = defaultdict(lambda: defaultdict(list))
 
@@ -2170,6 +2249,10 @@ def generar_reporte(eventos):
             agrupados,
             key=lambda x: etiqueta_corredor(x).casefold(),
         )
+
+        if corredores_ordenados:
+            story.append(EncabezadoSeccionFlowable("DETALLE EVENTOS VIAL", fecha_corte))
+            story.append(Spacer(1, 0.25 * cm))
 
         for idx_corredor, corredor_raw in enumerate(corredores_ordenados):
             departamentos = agrupados[corredor_raw]
